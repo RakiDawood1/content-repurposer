@@ -13,6 +13,11 @@ const PORT = process.env.PORT || 3000;
 app.use(helmet());
 app.use(cors());
 app.use(express.json());
+app.use(cors({
+  origin: ['https://portfolio-1-dee95f.webflow.io/', 'https://portfolio-1-dee95f.webflow.io/'],
+  methods: ['GET', 'POST'],
+  allowedHeaders: ['Content-Type']
+}));
 
 setupRoutes(app);
 
