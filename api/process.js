@@ -1,29 +1,31 @@
 // api/process.js
-const express = require('express');
-const cors = require('cors');
 const { processYouTubeUrl } = require('../src/controllers/combinedController');
 
-// Create a standalone Express app for the serverless function
-const app = express();
+module.exports = async (req, res) => {
+  // Set CORS headers
+  res.setHeader('Access-Control-Allow-Credentials', true);
+  res.setHeader('Access-Control-Allow-Origin', 'https://portfolio-1-dee95f.webflow.io');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
+  res.setHeader('Access-Control-Allow-Headers', 'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version');
 
-// Configure CORS specifically for this endpoint
-app.use(cors({
-  origin: ['https://portfolio-1-dee95f.webflow.io'],
-  methods: ['GET', 'POST', 'OPTIONS'],
-  credentials: true,
-  allowedHeaders: ['Content-Type', 'X-Requested-With']
-}));
+  // Handle preflight OPTIONS request
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
+  }
 
-app.use(express.json());
-
-// Handle OPTIONS requests explicitly
-app.options('*', cors());
-
-// Handle the actual POST request
-app.post('/', processYouTubeUrl);
-
-// Export as serverless function
-module.exports = (req, res) => {
-  // Pass the request to the Express app
-  app(req, res);
+  if (req.method === 'POST') {
+    try {
+      // Process the request using your existing controller
+      await processYouTubeUrl(req, res, (err) => {
+        if (err) {
+          return res.status(500).json({ error: err.message });
+        }
+      });
+    } catch (error) {
+      console.error('Error in process API:', error);
+      return res.status(500).json({ error: error.message });
+    }
+  } else {
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
 };
