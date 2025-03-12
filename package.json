@@ -5,7 +5,9 @@
   "scripts": {
     "test": "jest",
     "start": "node index.js",
-    "dev": "nodemon index.js"
+    "dev": "nodemon index.js",
+    "build": "ls -la && npm list --depth=0 && node index.js"
+
   },
   "keywords": [],
   "author": "",
