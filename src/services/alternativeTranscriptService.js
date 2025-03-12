@@ -1,12 +1,15 @@
-// src/services/transcriptService.js - Updated with alternative approaches
-const { YoutubeTranscript } = require('youtube-transcript');
+// src/services/alternativeTranscriptService.js
+const { Innertube } = require('youtubei.js');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
-const axios = require('axios');
 const logger = require('../utils/logger');
 
 let genAI;
 let geminiModel;
+let youtubeClient = null;
 
+/**
+ * Initialize the Gemini API for text processing
+ */
 function initializeGeminiAPI() {
   if (!process.env.GEMINI_API_KEY) {
     logger.error('GEMINI_API_KEY not found in environment variables');
@@ -19,6 +22,26 @@ function initializeGeminiAPI() {
   logger.info('Gemini API initialized successfully');
 }
 
+/**
+ * Initialize the YouTube client (lazy loading)
+ */
+async function getYouTubeClient() {
+  if (!youtubeClient) {
+    try {
+      logger.info('Initializing YouTube client');
+      youtubeClient = await Innertube.create();
+      logger.info('YouTube client initialized successfully');
+    } catch (error) {
+      logger.error(`Failed to initialize YouTube client: ${error.message}`);
+      throw new Error(`YouTube client initialization failed: ${error.message}`);
+    }
+  }
+  return youtubeClient;
+}
+
+/**
+ * Extract YouTube video ID from various URL formats
+ */
 function getVideoId(url) {
   try {
     if (!url) return null;
@@ -47,157 +70,105 @@ function getVideoId(url) {
   }
 }
 
-// Alternative method to check video info via oEmbed
-async function checkVideoInfo(videoId) {
-  try {
-    const response = await axios.get(`https://www.youtube.com/oembed?url=http://www.youtube.com/watch?v=${videoId}&format=json`);
-    return { 
-      exists: true, 
-      title: response.data.title,
-      author: response.data.author_name
-    };
-  } catch (error) {
-    logger.error(`Unable to fetch video info for ${videoId}: ${error.message}`);
-    return { exists: false, error: 'Video information unavailable' };
-  }
-}
-
-// Direct HTML parsing approach (fallback when API fails)
-async function directTranscriptCheck(videoId) {
-  try {
-    // Fetch video page HTML
-    const response = await axios.get(`https://www.youtube.com/watch?v=${videoId}`, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-      }
-    });
-    
-    const html = response.data;
-    
-    // Check if captions are mentioned in the page
-    const hasCaptions = html.includes('"captions":') || 
-                         html.includes('"captionTracks":') || 
-                         html.includes('timedtext');
-    
-    return {
-      hasTranscriptHint: hasCaptions,
-      pageAccessible: true
-    };
-  } catch (error) {
-    logger.error(`Direct page check failed for ${videoId}: ${error.message}`);
-    return {
-      hasTranscriptHint: false,
-      pageAccessible: false,
-      error: error.message
-    };
-  }
-}
-
+/**
+ * Fetch transcript using YouTubei.js
+ */
 async function fetchTranscript(videoId, language = 'en') {
   try {
-    logger.info(`Attempting to fetch transcript for video ${videoId}, language: ${language}`);
+    logger.info(`Fetching transcript for video ${videoId} using alternative method`);
     
-    // First check if video exists and is accessible
-    const videoInfo = await checkVideoInfo(videoId);
-    if (!videoInfo.exists) {
-      throw new Error(`Video ${videoId} not found or inaccessible`);
+    // Get YouTube client
+    const youtube = await getYouTubeClient();
+    
+    // Get video information
+    const info = await youtube.getInfo(videoId);
+    
+    // Get video details
+    const videoDetails = {
+      title: info.basic_info.title,
+      author: info.basic_info.author,
+      lengthSeconds: info.basic_info.duration.seconds
+    };
+    
+    logger.info(`Retrieved info for video: "${videoDetails.title}" by ${videoDetails.author}`);
+    
+    // Find available caption tracks
+    const captionTracks = info.captions?.caption_tracks || [];
+    
+    if (captionTracks.length === 0) {
+      logger.error(`No caption tracks available for video ${videoId}`);
+      throw new Error(`No captions available for this video (${videoId})`);
     }
     
-    // Try direct page check for transcript hints
-    const directCheck = await directTranscriptCheck(videoId);
+    // Try to find the requested language
+    let selectedTrack = captionTracks.find(track => 
+      track.language_code === language || 
+      track.language_code.startsWith(language + '-')
+    );
     
-    if (!directCheck.hasTranscriptHint) {
-      logger.warn(`Video ${videoId} likely has no captions available based on page check`);
+    // Fall back to English if requested language not found
+    if (!selectedTrack && language !== 'en') {
+      logger.warn(`Requested language ${language} not found, trying English`);
+      selectedTrack = captionTracks.find(track => 
+        track.language_code === 'en' || 
+        track.language_code.startsWith('en-')
+      );
     }
     
-    // Try multiple transcript fetch strategies
-    let transcriptList = null;
-    let fetchError = null;
-    
-    // Strategy 1: Standard approach with specified language
-    try {
-      transcriptList = await YoutubeTranscript.fetchTranscript(videoId, { lang: language });
-      if (transcriptList && transcriptList.length > 0) {
-        logger.info(`Successfully retrieved transcript with strategy 1`);
-      }
-    } catch (error) {
-      fetchError = error;
-      logger.warn(`Strategy 1 failed: ${error.message}`);
-      
-      // Strategy 2: Try without language specification (auto)
-      try {
-        transcriptList = await YoutubeTranscript.fetchTranscript(videoId);
-        if (transcriptList && transcriptList.length > 0) {
-          logger.info(`Successfully retrieved transcript with strategy 2`);
-        }
-      } catch (error2) {
-        logger.warn(`Strategy 2 failed: ${error2.message}`);
-        
-        // Strategy 3: Try with English explicitly
-        try {
-          transcriptList = await YoutubeTranscript.fetchTranscript(videoId, { lang: 'en' });
-          if (transcriptList && transcriptList.length > 0) {
-            logger.info(`Successfully retrieved transcript with strategy 3`);
-          }
-        } catch (error3) {
-          logger.warn(`Strategy 3 failed: ${error3.message}`);
-          
-          // Strategy 4: Try with additional headers/format
-          try {
-            // This is a more aggressive approach
-            transcriptList = await YoutubeTranscript.fetchTranscript(videoId, {
-              lang: language,
-              country: 'US'
-            });
-            if (transcriptList && transcriptList.length > 0) {
-              logger.info(`Successfully retrieved transcript with strategy 4`);
-            }
-          } catch (error4) {
-            logger.error(`All transcript fetch strategies failed for video ${videoId}`);
-            throw fetchError || error4; // Throw the original error for better diagnostics
-          }
-        }
-      }
+    // Fall back to first available track if neither requested nor English found
+    if (!selectedTrack) {
+      logger.warn(`Falling back to first available caption track: ${captionTracks[0].language_code}`);
+      selectedTrack = captionTracks[0];
     }
     
-    // Final check if transcript is valid
-    if (!transcriptList || transcriptList.length === 0) {
-      throw new Error('Empty transcript retrieved');
+    // Fetch the caption track
+    const captionTrack = await youtube.getCaption(selectedTrack.id);
+    
+    if (!captionTrack || !captionTrack.body?.length) {
+      throw new Error('Retrieved caption track is empty');
     }
     
-    logger.info(`Successfully retrieved transcript with ${transcriptList.length} segments`);
+    logger.info(`Successfully retrieved transcript with ${captionTrack.body.length} segments in language ${selectedTrack.language_code}`);
     
-    // Format transcript data
-    return transcriptList.map(item => ({
-      text: item.text || '',
-      start: item.start || 0,
-      duration: item.duration || 0,
+    // Format caption track similar to youtube-transcript format
+    return captionTrack.body.map(item => ({
+      text: item.text,
+      start: item.start,
+      duration: item.duration,
+      language: selectedTrack.language_code
     }));
   } catch (error) {
-    // Enhanced error reporting
-    if (error.message.includes('disabled on this video')) {
-      logger.error(`Transcript disabled for video ${videoId}: ${error.message}`);
-      throw new Error(`Transcript is disabled for this video (${videoId}). Please try a different video or use a video with captions enabled.`);
-    } else if (error.message.includes('Could not find any translations')) {
-      logger.error(`No transcript found for language ${language} for video ${videoId}`);
-      throw new Error(`No transcript available in the requested language (${language}). Try a different language or video.`);
+    logger.error(`Error fetching transcript with alternative method: ${error.message}`);
+    
+    if (error.message.includes('No captions available')) {
+      throw new Error(`Transcript unavailable: No captions found for video ${videoId}`);
+    } else if (error.message.includes('Video unavailable')) {
+      throw new Error(`Video unavailable: The video ${videoId} may be private, deleted, or age-restricted`);
     } else {
-      const videoTitle = await checkVideoInfo(videoId).then(info => info.title || videoId).catch(() => videoId);
-      logger.error(`Failed to fetch transcript for "${videoTitle}" (${videoId}): ${error.message}`);
-      throw new Error(`Unable to fetch transcript: ${error.message}`);
+      throw new Error(`Failed to fetch transcript: ${error.message}`);
     }
   }
 }
 
+/**
+ * Generate a fallback message when no transcript is available
+ */
 async function generateBasicTranscript(videoId) {
   if (!geminiModel) {
     initializeGeminiAPI();
   }
   
   try {
-    // Get video info for better message
-    const videoInfo = await checkVideoInfo(videoId).catch(() => ({ title: 'this video' }));
-    const videoTitle = videoInfo.title || 'this video';
+    // Try to get video info for a better message
+    let videoTitle = "this video";
+    
+    try {
+      const youtube = await getYouTubeClient();
+      const info = await youtube.getInfo(videoId);
+      videoTitle = info.basic_info.title || "this video";
+    } catch (error) {
+      logger.warn(`Couldn't get video title for fallback message: ${error.message}`);
+    }
     
     const prompt = `
 I need a placeholder message for a YouTube video when the transcript is unavailable.
@@ -205,7 +176,7 @@ The video ID is ${videoId} and its title is "${videoTitle}".
 
 Please create a brief message that:
 1. Explains that the transcript couldn't be retrieved for this specific video
-2. Mentions the title of the video if available
+2. Mentions the title of the video
 3. Suggests that either the video doesn't have captions enabled or they're not accessible
 4. Recommends trying a different video that has captions enabled
 5. Keeps the tone helpful and informative
@@ -227,7 +198,7 @@ Format this as a short paragraph (2-3 sentences).
   } catch (error) {
     logger.error(`Error generating basic transcript message: ${error.message}`);
     return [{
-      text: `I'm sorry, the transcript for this video (${videoId}) is unavailable. The video likely doesn't have captions enabled or they're not accessible. Please try a different video with captions enabled.`,
+      text: `I'm sorry, the transcript for "${videoId}" is unavailable. The video likely doesn't have captions enabled or they're not accessible. Please try a different video with captions enabled.`,
       start: 0,
       duration: 10,
       isUnavailableMessage: true
@@ -235,6 +206,9 @@ Format this as a short paragraph (2-3 sentences).
   }
 }
 
+/**
+ * Refine transcript using Gemini
+ */
 async function refineTranscript(transcript) {
   if (!transcript || !Array.isArray(transcript) || transcript.length === 0) {
     logger.warn('No transcript data provided for refinement');
@@ -279,6 +253,9 @@ async function refineTranscript(transcript) {
   }
 }
 
+/**
+ * Helper to refine a batch of transcript segments
+ */
 async function refineBatchWithGemini(batchSegments) {
   const segmentTexts = batchSegments.map(segment => segment.text);
   
@@ -340,6 +317,5 @@ module.exports = {
   refineTranscript,
   initializeGeminiAPI,
   generateBasicTranscript,
-  checkVideoInfo,
-  directTranscriptCheck
+  getYouTubeClient
 };

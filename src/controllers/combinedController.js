@@ -1,7 +1,9 @@
-// src/controllers/combinedController.js - Enhanced with better error handling
-const { getVideoId, fetchTranscript, refineTranscript, checkVideoAvailability } = require('../services/transcriptService');
+// src/controllers/combinedController.js - With fallback to alternative service
+const originalService = require('../services/transcriptService');
+const alternativeService = require('../services/alternativeTranscriptService');
 const { generateBlogFromTranscript } = require('../services/blogGeneratorService');
 const logger = require('../utils/logger');
+const { debugTranscriptIssue } = require('../utils/transcriptDebug');
 const NodeCache = require('node-cache');
 
 // In-memory cache with TTL (Time-To-Live)
@@ -12,11 +14,20 @@ const combinedCache = new NodeCache({
 
 /**
  * Process a YouTube URL to get transcript and generate a blog in one request
+ * With fallback to alternative transcript service
  */
 async function processYouTubeUrl(req, res, next) {
   try {
     // Get parameters from request
-    const { url, language = 'en', skipRefinement = false, generateBlog = true } = req.body;
+    const { 
+      url, 
+      language = 'en', 
+      skipRefinement = false, 
+      generateBlog = true, 
+      fallbackMessage = true,
+      debug = false,
+      preferAlternativeService = false  // New option to prefer alternative service
+    } = req.body;
     
     // Validate request
     if (!url) {
@@ -28,7 +39,7 @@ async function processYouTubeUrl(req, res, next) {
     }
     
     // Extract video ID
-    const videoId = getVideoId(url);
+    const videoId = originalService.getVideoId(url);
     if (!videoId) {
       return res.status(400).json({ 
         success: false,
@@ -37,20 +48,26 @@ async function processYouTubeUrl(req, res, next) {
       });
     }
     
-    logger.info(`Processing video ${videoId} with language ${language}`);
-
-    // Check video availability before proceeding
-    const videoAvailability = await checkVideoAvailability(videoId);
-    if (!videoAvailability.exists) {
-      return res.status(404).json({ 
-        success: false,
-        error: 'Video not available',
-        message: videoAvailability.error
-      });
+    // Debug mode - collect detailed information
+    if (debug) {
+      logger.info(`Running in debug mode for video ${videoId}`);
+      try {
+        const debugInfo = await debugTranscriptIssue(videoId, { language });
+        return res.json({
+          success: true,
+          debug: true,
+          debugInfo
+        });
+      } catch (debugError) {
+        logger.error(`Debug mode failed: ${debugError.message}`);
+        // Continue with normal processing
+      }
     }
     
+    logger.info(`Processing video ${videoId} with language ${language}`);
+    
     // Create a unique cache key based on all parameters
-    const cacheKey = `combined-${videoId}-${language}-${skipRefinement}-${generateBlog}`;
+    const cacheKey = `combined-${videoId}-${language}-${skipRefinement}-${generateBlog}-${fallbackMessage}-${preferAlternativeService}`;
     const cachedResult = combinedCache.get(cacheKey);
     
     if (cachedResult) {
@@ -66,49 +83,81 @@ async function processYouTubeUrl(req, res, next) {
     logger.info(`Processing video ${videoId} for transcript and blog`);
     const startTime = Date.now();
     
-    // 1. Fetch transcript with comprehensive error handling
-    let rawTranscript;
+    // Try to fetch the transcript using the appropriate service
+    let transcript;
+    let transcriptUnavailable = false;
+    let usedAlternativeService = false;
+    let transcriptError = null;
+    
+    // Determine which service to try first
+    const primaryService = preferAlternativeService ? alternativeService : originalService;
+    const secondaryService = preferAlternativeService ? originalService : alternativeService;
+    
+    // First attempt with primary service
     try {
-      rawTranscript = await fetchTranscript(videoId, language);
+      logger.info(`Attempting to fetch transcript with ${preferAlternativeService ? 'alternative' : 'original'} service`);
+      transcript = await primaryService.fetchTranscript(videoId, language);
       
-      if (!rawTranscript || rawTranscript.length === 0) {
-        throw new Error('Empty transcript retrieved');
+      if (preferAlternativeService) {
+        usedAlternativeService = true;
       }
+    } catch (primaryError) {
+      logger.warn(`Primary transcript service failed: ${primaryError.message}`);
+      transcriptError = primaryError;
       
-      logger.info(`Successfully fetched transcript with ${rawTranscript.length} segments`);
-    } catch (transcriptError) {
-      logger.error(`Transcript error: ${transcriptError.message}`);
-      return res.status(404).json({ 
-        success: false,
-        error: 'Transcript unavailable',
-        message: transcriptError.message,
-        videoId,
-        videoTitle: videoAvailability.title
-      });
+      // Second attempt with secondary service
+      try {
+        logger.info(`Attempting to fetch transcript with ${preferAlternativeService ? 'original' : 'alternative'} service`);
+        transcript = await secondaryService.fetchTranscript(videoId, language);
+        
+        if (!preferAlternativeService) {
+          usedAlternativeService = true;
+        }
+      } catch (secondaryError) {
+        logger.warn(`Secondary transcript service failed: ${secondaryError.message}`);
+        
+        // Both services failed - use fallback message if enabled
+        if (fallbackMessage) {
+          logger.info('Using fallback message in place of transcript');
+          // Use the service that's available for the fallback message
+          const fallbackService = alternativeService.generateBasicTranscript ? alternativeService : originalService;
+          transcript = await fallbackService.generateBasicTranscript(videoId);
+          transcriptUnavailable = true;
+        } else {
+          // Return error if fallback message is disabled
+          return res.status(404).json({
+            success: false,
+            error: 'Transcript unavailable',
+            message: `Unable to retrieve transcript: ${primaryError.message}`,
+            videoId
+          });
+        }
+      }
     }
     
-    // 2. Refine transcript if needed with error handling
+    // Refine transcript if needed and available
     let refinedTranscript = null;
-    if (!skipRefinement) {
+    if (!skipRefinement && !transcriptUnavailable) {
       try {
-        refinedTranscript = await refineTranscript(rawTranscript);
-        logger.info(`Successfully refined transcript with ${refinedTranscript.length} segments`);
+        // Use the service that provided the transcript
+        const refinementService = usedAlternativeService ? alternativeService : originalService;
+        refinedTranscript = await refinementService.refineTranscript(transcript);
       } catch (refinementError) {
         logger.warn(`Transcript refinement failed: ${refinementError.message}`);
-        logger.info('Proceeding with raw transcript');
-        // Continue with raw transcript rather than failing
+        // Continue with unrefined transcript
       }
     }
     
-    // 3. Prepare the transcript response
+    // Prepare the transcript response
     const transcriptResult = {
       videoId,
-      videoTitle: videoAvailability.title,
-      raw: rawTranscript,
-      refined: refinedTranscript || null
+      raw: transcript,
+      refined: refinedTranscript,
+      transcriptUnavailable,
+      usedAlternativeService
     };
     
-    // 4. If blog generation is not required, return just the transcript
+    // If blog generation is not required, return just the transcript
     if (!generateBlog) {
       const result = {
         success: true,
@@ -120,24 +169,28 @@ async function processYouTubeUrl(req, res, next) {
       return res.json(result);
     }
     
-    // 5. Generate blog from the best available transcript
-    const transcriptToUse = refinedTranscript || rawTranscript;
-    
+    // Generate blog from the best available transcript
     let blog;
     try {
-      blog = await generateBlogFromTranscript(transcriptToUse, videoId, videoAvailability.title);
-      logger.info('Successfully generated blog post');
+      // Use the best available transcript version
+      const transcriptToUse = refinedTranscript || transcript;
+      blog = await generateBlogFromTranscript(transcriptToUse, videoId);
+      
+      // Add a note if this was generated from a fallback message
+      if (transcriptUnavailable) {
+        blog.note = "This blog was generated without an actual video transcript. The content is based on a generic message as the video's transcript was unavailable.";
+      }
     } catch (blogError) {
       logger.error(`Blog generation failed: ${blogError.message}`);
-      return res.status(500).json({ 
+      return res.status(500).json({
         success: false,
         error: 'Blog generation failed',
         message: blogError.message,
-        transcript: transcriptResult // Return transcript even if blog fails
+        transcript: transcriptResult
       });
     }
     
-    // 6. Combine results
+    // Combine results
     const result = {
       success: true,
       ...transcriptResult,
