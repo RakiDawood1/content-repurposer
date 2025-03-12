@@ -1,9 +1,34 @@
 // src/controllers/combinedController.js - With fallback to alternative service
 const originalService = require('../services/transcriptService');
-const alternativeService = require('../services/alternativeTranscriptService');
+let alternativeService;
+
+// Lazy-load alternative service to prevent startup errors if module is missing
+function getAlternativeService() {
+  if (!alternativeService) {
+    try {
+      alternativeService = require('../services/alternativeTranscriptService');
+      console.log('Alternative transcript service loaded successfully');
+    } catch (error) {
+      console.error(`Failed to load alternative transcript service: ${error.message}`);
+      alternativeService = null;
+    }
+  }
+  return alternativeService;
+}
+
 const { generateBlogFromTranscript } = require('../services/blogGeneratorService');
 const logger = require('../utils/logger');
-const { debugTranscriptIssue } = require('../utils/transcriptDebug');
+
+// Try to load debug utility, but don't fail if not available
+let debugTranscriptIssue;
+try {
+  const debugUtils = require('../utils/transcriptDebug');
+  debugTranscriptIssue = debugUtils.debugTranscriptIssue;
+} catch (error) {
+  console.warn(`Debug utility not available: ${error.message}`);
+  debugTranscriptIssue = null;
+}
+
 const NodeCache = require('node-cache');
 
 // In-memory cache with TTL (Time-To-Live)
@@ -29,6 +54,8 @@ async function processYouTubeUrl(req, res, next) {
       preferAlternativeService = false  // New option to prefer alternative service
     } = req.body;
     
+    console.log(`Request received with preferAlternativeService: ${preferAlternativeService}`);
+    
     // Validate request
     if (!url) {
       return res.status(400).json({ 
@@ -49,7 +76,7 @@ async function processYouTubeUrl(req, res, next) {
     }
     
     // Debug mode - collect detailed information
-    if (debug) {
+    if (debug && debugTranscriptIssue) {
       logger.info(`Running in debug mode for video ${videoId}`);
       try {
         const debugInfo = await debugTranscriptIssue(videoId, { language });
@@ -89,39 +116,64 @@ async function processYouTubeUrl(req, res, next) {
     let usedAlternativeService = false;
     let transcriptError = null;
     
+    // Check if alternative service is available
+    const altService = preferAlternativeService ? getAlternativeService() : null;
+    
+    if (preferAlternativeService && !altService) {
+      logger.warn('Alternative service requested but not available, falling back to original service');
+    }
+    
+    console.log(`Using service: ${(preferAlternativeService && altService) ? 'alternative' : 'original'}`);
+    
     // Determine which service to try first
-    const primaryService = preferAlternativeService ? alternativeService : originalService;
-    const secondaryService = preferAlternativeService ? originalService : alternativeService;
+    const primaryService = (preferAlternativeService && altService) ? altService : originalService;
+    const secondaryService = (preferAlternativeService && altService) ? originalService : altService;
     
     // First attempt with primary service
     try {
-      logger.info(`Attempting to fetch transcript with ${preferAlternativeService ? 'alternative' : 'original'} service`);
+      logger.info(`Attempting to fetch transcript with ${(preferAlternativeService && altService) ? 'alternative' : 'original'} service`);
       transcript = await primaryService.fetchTranscript(videoId, language);
       
-      if (preferAlternativeService) {
+      if (preferAlternativeService && altService) {
         usedAlternativeService = true;
       }
     } catch (primaryError) {
       logger.warn(`Primary transcript service failed: ${primaryError.message}`);
       transcriptError = primaryError;
       
-      // Second attempt with secondary service
-      try {
-        logger.info(`Attempting to fetch transcript with ${preferAlternativeService ? 'original' : 'alternative'} service`);
-        transcript = await secondaryService.fetchTranscript(videoId, language);
-        
-        if (!preferAlternativeService) {
-          usedAlternativeService = true;
+      // Second attempt with secondary service if available
+      if (secondaryService) {
+        try {
+          logger.info(`Attempting to fetch transcript with ${(preferAlternativeService && altService) ? 'original' : 'alternative'} service`);
+          transcript = await secondaryService.fetchTranscript(videoId, language);
+          
+          if (!(preferAlternativeService && altService)) {
+            usedAlternativeService = true;
+          }
+        } catch (secondaryError) {
+          logger.warn(`Secondary transcript service failed: ${secondaryError.message}`);
+          
+          // Both services failed - use fallback message if enabled
+          if (fallbackMessage) {
+            logger.info('Using fallback message in place of transcript');
+            // Use the primary service for the fallback message
+            transcript = await primaryService.generateBasicTranscript(videoId);
+            transcriptUnavailable = true;
+          } else {
+            // Return error if fallback message is disabled
+            return res.status(404).json({
+              success: false,
+              error: 'Transcript unavailable',
+              message: `Unable to retrieve transcript: ${primaryError.message}`,
+              videoId
+            });
+          }
         }
-      } catch (secondaryError) {
-        logger.warn(`Secondary transcript service failed: ${secondaryError.message}`);
-        
-        // Both services failed - use fallback message if enabled
+      } else {
+        // No secondary service available - use fallback message if enabled
         if (fallbackMessage) {
-          logger.info('Using fallback message in place of transcript');
-          // Use the service that's available for the fallback message
-          const fallbackService = alternativeService.generateBasicTranscript ? alternativeService : originalService;
-          transcript = await fallbackService.generateBasicTranscript(videoId);
+          logger.info('Using fallback message in place of transcript (no alternative service available)');
+          transcript = await primaryService.generateBasicTranscript(videoId);
           transcriptUnavailable = true;
         } else {
           // Return error if fallback message is disabled
@@ -140,7 +192,7 @@ async function processYouTubeUrl(req, res, next) {
     if (!skipRefinement && !transcriptUnavailable) {
       try {
         // Use the service that provided the transcript
-        const refinementService = usedAlternativeService ? alternativeService : originalService;
+        const refinementService = usedAlternativeService ? getAlternativeService() : originalService;
         refinedTranscript = await refinementService.refineTranscript(transcript);
       } catch (refinementError) {
         logger.warn(`Transcript refinement failed: ${refinementError.message}`);
