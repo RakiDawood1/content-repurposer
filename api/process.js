@@ -1,38 +1,11 @@
-// api/process.js - Enhanced with better error handling for Vercel
+// api/process.js - Updated with support for alternative service and debug mode
 require('dotenv').config();
 const { processYouTubeUrl } = require('../src/controllers/combinedController');
 
-// Custom error handler for serverless function
-const handleError = (error, res) => {
-  console.error('API Error:', error);
-  
-  // Determine appropriate status code
-  let statusCode = 500;
-  let errorMessage = 'An unexpected error occurred';
-  
-  if (error.message && (
-    error.message.includes('Transcript not available') ||
-    error.message.includes('disabled on this video') ||
-    error.message.includes('No transcript available')
-  )) {
-    statusCode = 404;
-    errorMessage = error.message;
-  } else if (error.message && error.message.includes('Invalid YouTube URL')) {
-    statusCode = 400;
-    errorMessage = error.message;
-  }
-  
-  return res.status(statusCode).json({
-    success: false,
-    error: errorMessage,
-    timestamp: new Date().toISOString()
-  });
-};
-
 module.exports = async (req, res) => {
-  // Set CORS headers
+  // Set CORS headers - allow from any origin for testing
   res.setHeader('Access-Control-Allow-Credentials', true);
-  res.setHeader('Access-Control-Allow-Origin', '*');  // Allow from any origin for testing
+  res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
   res.setHeader('Access-Control-Allow-Headers', 'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version');
 
@@ -52,7 +25,36 @@ module.exports = async (req, res) => {
         });
       }
       
-      // Handle missing request body
+      // Provide endpoint documentation if requested
+      if (req.body && req.body.docs) {
+        return res.status(200).json({
+          success: true,
+          message: 'API Documentation',
+          endpoint: '/api/process',
+          method: 'POST',
+          parameters: {
+            url: 'YouTube video URL (required)',
+            language: 'Language code, defaults to "en"',
+            skipRefinement: 'Boolean, skip transcript refinement',
+            generateBlog: 'Boolean, generate blog post',
+            fallbackMessage: 'Boolean, provide fallback message for unavailable transcripts',
+            preferAlternativeService: 'Boolean, use alternative transcript service as primary',
+            debug: 'Boolean, run in debug mode to collect detailed information'
+          },
+          example: {
+            url: 'https://www.youtube.com/watch?v=VIDEO_ID',
+            language: 'en',
+            skipRefinement: false,
+            generateBlog: true,
+            fallbackMessage: true,
+            preferAlternativeService: true,
+            debug: false
+          },
+          timestamp: new Date().toISOString()
+        });
+      }
+      
+      // Check for missing/empty request body
       if (!req.body || Object.keys(req.body).length === 0) {
         return res.status(400).json({
           success: false,
@@ -62,14 +64,26 @@ module.exports = async (req, res) => {
         });
       }
 
-      // Process the request using the controller
+      // Process the request using the combined controller
       await processYouTubeUrl(req, res, (err) => {
         if (err) {
-          handleError(err, res);
+          console.error('Error in process API:', err);
+          return res.status(500).json({ 
+            success: false,
+            error: 'Processing error',
+            message: err.message,
+            timestamp: new Date().toISOString()
+          });
         }
       });
     } catch (error) {
-      handleError(error, res);
+      console.error('Unhandled error in process API:', error);
+      return res.status(500).json({ 
+        success: false,
+        error: 'Unhandled error',
+        message: error.message,
+        timestamp: new Date().toISOString()
+      });
     }
   } else {
     // Method not allowed
