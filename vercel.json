@@ -12,17 +12,25 @@
   ],
   "routes": [
     {
+      "src": "/api/debug",
+      "dest": "/api/debug.js",
+      "methods": ["GET"]
+    },
+    {
       "src": "/api/process",
       "dest": "/api/process.js",
       "methods": ["OPTIONS", "POST"]
     },
     {
-      "src": "/api/(.+)",
-      "dest": "/index.js"
+      "src": "/api/(.*)",
+      "dest": "/api/$1.js"
     },
     {
       "src": "/(.*)",
       "dest": "/index.js"
     }
-  ]
+  ],
+  "env": {
+    "NODE_ENV": "production"
+  }
 }
